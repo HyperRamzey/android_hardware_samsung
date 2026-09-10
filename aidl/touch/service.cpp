@@ -30,7 +30,10 @@ int main() {
     if (gm->isSupported()) {
         const std::string gm_instance = std::string(GloveMode::descriptor) + "/default";
         status = AServiceManager_addService(gm->asBinder().get(), gm_instance.c_str());
-        CHECK_EQ(status, STATUS_OK) << "Failed to add service " << gm_instance << " " << status;
+        if (status != STATUS_OK) {
+        LOG(ERROR) << "Failed to add service " << gm_instance << " " << status
+                << " - continuing without this interface";
+    }
     }
 
     std::shared_ptr<HighTouchPollingRate> htpr = ndk::SharedRefBase::make<HighTouchPollingRate>();
@@ -38,28 +41,40 @@ int main() {
         const std::string htpr_instance =
                 std::string(HighTouchPollingRate::descriptor) + "/default";
         status = AServiceManager_addService(htpr->asBinder().get(), htpr_instance.c_str());
-        CHECK_EQ(status, STATUS_OK) << "Failed to add service " << htpr_instance << " " << status;
+        if (status != STATUS_OK) {
+        LOG(ERROR) << "Failed to add service " << htpr_instance << " " << status
+                << " - continuing without this interface";
+    }
     }
 
     std::shared_ptr<KeyDisabler> kd = ndk::SharedRefBase::make<KeyDisabler>();
     if (kd->isSupported()) {
         const std::string kd_instance = std::string(KeyDisabler::descriptor) + "/default";
         status = AServiceManager_addService(kd->asBinder().get(), kd_instance.c_str());
-        CHECK_EQ(status, STATUS_OK) << "Failed to add service " << kd_instance << " " << status;
+        if (status != STATUS_OK) {
+        LOG(ERROR) << "Failed to add service " << kd_instance << " " << status
+                << " - continuing without this interface";
+    }
     }
 
     std::shared_ptr<StylusMode> sm = ndk::SharedRefBase::make<StylusMode>();
     if (sm->isSupported()) {
         const std::string sm_instance = std::string(StylusMode::descriptor) + "/default";
         status = AServiceManager_addService(sm->asBinder().get(), sm_instance.c_str());
-        CHECK_EQ(status, STATUS_OK) << "Failed to add service " << sm_instance << " " << status;
+        if (status != STATUS_OK) {
+        LOG(ERROR) << "Failed to add service " << sm_instance << " " << status
+                << " - continuing without this interface";
+    }
     }
 
     std::shared_ptr<TouchscreenGesture> tg = ndk::SharedRefBase::make<TouchscreenGesture>();
     if (tg->isSupported()) {
         const std::string tg_instance = std::string(TouchscreenGesture::descriptor) + "/default";
         status = AServiceManager_addService(tg->asBinder().get(), tg_instance.c_str());
-        CHECK_EQ(status, STATUS_OK) << "Failed to add service " << tg_instance << " " << status;
+        if (status != STATUS_OK) {
+        LOG(ERROR) << "Failed to add service " << tg_instance << " " << status
+                << " - continuing without this interface";
+    }
     }
 
     ABinderProcess_joinThreadPool();
