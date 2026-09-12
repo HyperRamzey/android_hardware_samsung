@@ -21,8 +21,6 @@
 #include <android/binder_process.h>
 
 #include <aidl/vendor/samsung/hardware/radio/network/ISehRadioNetwork.h>
-#include <vendor/samsung/hardware/radio/2.0/ISehRadio.h>
-#include <vendor/samsung/hardware/radio/2.1/ISehRadio.h>
 #include <vendor/samsung/hardware/radio/2.2/ISehRadio.h>
 
 using namespace std::chrono_literals;
@@ -40,8 +38,7 @@ using android::hidl::base::V1_0::IBase;
 using aidl::vendor::samsung::hardware::radio::network::ISehRadioNetwork;
 using aidl::vendor::samsung::hardware::radio::network::implementation::SehRadioNetworkIndication;
 using aidl::vendor::samsung::hardware::radio::network::implementation::SehRadioNetworkResponse;
-typedef vendor::samsung::hardware::radio::V2_2::ISehRadio ISehRadioV2_2;
-using V2_0ISehRadio = vendor::samsung::hardware::radio::V2_0::ISehRadio;
+using vendor::samsung::hardware::radio::V2_2::ISehRadio;
 using vendor::samsung::hardware::radio::V2_2::SehVendorConfiguration;
 using vendor::samsung::hardware::radio::V2_2::implementation::SehRadioIndication;
 using vendor::samsung::hardware::radio::V2_2::implementation::SehRadioResponse;
@@ -112,28 +109,11 @@ int main() {
             auto config = LoadConfiguration<SehVendorConfiguration>(content);
             auto samsungIndication = sp<SehRadioIndication>::make();
             auto samsungResponse = sp<SehRadioResponse>::make();
-            // Fetch via the base 2.0 interface: this is what rild registers
-            // (2.0/2.1 on this device); 2.2 getService() would return null.
-            auto svcBase = V2_0ISehRadio::getService(slotName);
-            if (svcBase == nullptr) {
-                LOG(ERROR) << "ISehRadio service not found for " << slotName
-                           << "; skipping slot (rild not up yet?)";
-                continue;
-            }
-            svcBase->setResponseFunction(samsungResponse, samsungIndication);
-            // setVendorSpecificConfiguration is 2.2-only; try the upcast and
-            // skip FW_READY config if this rild does not serve 2.2.
-            // castFrom returns Return<sp<T>>; a rild that serves only
-            // 2.0/2.1 makes this cast fail -> withDefault gives a null sp.
-            sp<ISehRadioV2_2> svc22 = ISehRadioV2_2::castFrom(svcBase).withDefault(nullptr);
-            if (svc22 != nullptr) {
-                svc22->setVendorSpecificConfiguration(0x3232, hidl_vec(config));
-            } else {
-                LOG(WARNING) << "ISehRadio 2.2 not served by rild; "
-                            << "skipping vendor config (FW_READY)";
-            }
-            svcBase->linkToDeath(gHidlHalDeathRecipient, 0);
-            svcBase->incStrong(gHidlHalDeathRecipient.get());
+            auto svc = ISehRadio::getService(slotName);
+            svc->setResponseFunction(samsungResponse, samsungIndication);
+            svc->setVendorSpecificConfiguration(0x3232, hidl_vec(config));
+            svc->linkToDeath(gHidlHalDeathRecipient, 0);
+            svc->incStrong(gHidlHalDeathRecipient.get());
         }
         LOG(INFO) << "Done (slot" << slot << ")";
     }
