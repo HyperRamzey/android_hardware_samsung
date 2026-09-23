@@ -74,7 +74,12 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
     hw_auth_token_t authToken;
     translate(hat, authToken);
 
-    int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 0 /* timeoutSec */);
+    // NOTE (a30s ET715): timeoutSec must be non-zero. The vendor lib SKIPS Trustlet
+    // cmd 49 (sensor enroll-config) when it is 0 ("Skip cmd : 0xc, opcode : 49" in
+    // logcat); stock and the working a51 reference both enroll with a real timeout,
+    // and an unconfigured sensor rejects every frame (BAuth BAD_QUALITY 39).
+    // 60 s matches the AOSP framework enroll budget a51 passes through.
+    int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 60 /* timeoutSec */);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_enroll failed: " << error;
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
