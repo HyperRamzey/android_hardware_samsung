@@ -80,11 +80,13 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
-    if (FingerprintHalProperties::force_calibrate().value_or(false)) {
-        while (!mCaptureReady) {
-            std::this_thread::sleep_for(100ms);
-        }
-    }
+    // NOTE (a30s ET715): do NOT block here waiting for CAPTURE_READY. The old
+    // while(!mCaptureReady) loop held this binder thread forever with no timeout,
+    // wedging the framework scheduler (and making enroll uncancellable) whenever
+    // calibration did not complete. Stock OneUI instead swallows early touches
+    // until its enroll animation finishes (giving CBGE a finger-off window); we
+    // reproduce that below by gating TOUCH_EVENT forwarding on mCaptureReady.
+    // Progress callbacks arrive via notify() on HAL worker threads regardless.
 
     *out = SharedRefBase::make<CancellationSignal>(this);
     return ndk::ScopedAStatus::ok();
@@ -199,6 +201,15 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t /*x*/, 
                                           float /*minor*/, float /*major*/) {
     LOG(INFO) << "onPointerDown";
 
+    // a30s ET715: while force_calibrate calibration is pending (!mCaptureReady),
+    // swallow the touch like stock OneUI does during its enroll animation: forwarding
+    // TOUCH_EVENT mid-calibration poisons the background reference and every frame
+    // is then rejected (BAuth BAD_QUALITY 39 for the whole session).
+    if (FingerprintHalProperties::force_calibrate().value_or(false) && !mCaptureReady) {
+        LOG(INFO) << "onPointerDown swallowed (calibration pending)";
+        return ndk::ScopedAStatus::ok();
+    }
+
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
         mHal.request(SEM_REQUEST_TOUCH_EVENT, 2);
     }
@@ -210,6 +221,10 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t /*x*/, 
 
 ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
     LOG(INFO) << "onPointerUp";
+
+    if (FingerprintHalProperties::force_calibrate().value_or(false) && !mCaptureReady) {
+        return ndk::ScopedAStatus::ok();
+    }
 
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
         mHal.request(SEM_REQUEST_TOUCH_EVENT, 1);
