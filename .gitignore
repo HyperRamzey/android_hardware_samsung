@@ -1,1 +1,4 @@
 /nfc
+
+# stray editor/patch backup from the touch-service fix (real fix is in 04272e9)
+*.orig_touchfix
