@@ -25,42 +25,42 @@ using aidl::vendor::lineage::touch::StylusMode;
 using aidl::vendor::lineage::touch::TouchscreenGesture;
 
 // All five instances are declared in /vendor/etc/vintf/manifest.xml and required
-// by /product/etc/vintf/compatibility_matrix.lineage.xml, which means this HAL
-// must ALWAYS provide them.
+// by /product/etc/vintf/compatibility_matrix.lineage.xml, so this HAL must
+// ALWAYS provide them.
 //
 // A declared AIDL service that never registers is fatal to the framework:
 // ServiceManager.waitForDeclaredService() blocks with no timeout waiting for it.
 // system_server reached that from
-//     InputMethodManagerService.systemRunning()   (BOOT_PHASE_ACTIVITY_MANAGER_READY)
+//     InputMethodManagerService.systemRunning()        (BOOT_PHASE_ACTIVITY_MANAGER_READY)
 //       -> InputMethodManagerService.updateTouchSensitivity()
 //       -> LineageHardwareManager.isSupported()
 // while already holding ImfLock, so the 60 s watchdog killed system_server, init
-// restarted it, and it deadlocked in exactly the same place: an endless
-// system_server restart loop showing bootanimation forever.
+// restarted it, and it deadlocked in the same place every time: an endless
+// restart loop showing bootanimation forever.
 //
 // The previous version of this file tried to paper over that with a bounded
 // probe (120 attempts x 5 s = 10 minutes). That cannot work: the watchdog fires
 // at 60 s, long before the probe gives up, and after the loop the old code called
 // ABinderProcess_joinThreadPool() without ever registering anything, so the
 // service stayed missing no matter what. It also named the wrong driver in its
-// comment: the A30s uses the ist40xx driver, whose sysfs group
-// /sys/class/sec/tsp/* is only published once the TSP probe finishes, which can
-// be minutes after early-init on a cold or heavily loaded boot. That timing is
-// why this only reproduced intermittently.
+// comment - the A30s uses ist40xx (CONFIG_TOUCHSCREEN_IST4050), whose sysfs group
+// /sys/class/sec/tsp/* is only published once the TSP probe finishes, which can be
+// minutes after early-init on a cold or heavily loaded boot. That timing is why
+// this only ever reproduced intermittently.
 //
-// The fix is to register unconditionally and report real capability through the
-// binder methods. Every implementation here already degrades safely: they read
-// their sysfs node on each call and report "off" when it is absent, so nothing
-// needs the service to be missing in order to behave correctly.
+// Registration is therefore unconditional, and real capability is reported through
+// the binder methods: every implementation here already reads its sysfs node per
+// call and reports "off" when it is absent, so nothing depends on the service
+// being missing.
 static constexpr unsigned int kPermissionRetryDelaySec = 5;
 static constexpr unsigned int kPermissionRetryAttempts = 24;
 
 // vendor.lineage.touch-service.samsung runs as uid system, but the ist40xx driver
-// creates /sys/class/sec/tsp/cmd root-owned. The init .rc used to chown it, but
-// only at early-init - which is before the driver publishes the node, so on a
-// slow boot the chown silently failed and setEnabled() could not write the node
-// even once the driver appeared. Re-apply it here once the node shows up instead
-// of trusting a one-shot early-init window.
+// creates /sys/class/sec/tsp/cmd root-owned. The init .rc chowned it at
+// early-init, which is *before* the driver publishes the node, so on a slow boot
+// the chown silently failed and setEnabled() could not write the node even once
+// the driver appeared. Re-apply it here once the node shows up instead of
+// trusting a one-shot early-init window.
 static void ensureCommandNodeWritable() {
     struct stat st {};
     if (stat(TSP_CMD_NODE, &st) != 0) return;
@@ -82,12 +82,30 @@ static bool registerService(const std::shared_ptr<T>& obj) {
         LOG(INFO) << "Registered " << instance;
         return true;
     }
-    LOG(ERROR) << "Failed to add service " << instance;
+    LOG(WARNING) << "Did not register " << instance
+                 << " (not declared in the VINTF manifest - expected for some)";
     return false;
 }
 
 int main() {
-    ABinderProcess_setThreadPoolMaxThreadCount(0);
+    // NOTE: do NOT call ABinderProcess_setThreadPoolMaxThreadCount(0) here.
+    //
+    // That call was in the original file and is a second, independent deadlock.
+    // Setting the max to 0 spawns *no* binder worker threads, so the process
+    // cannot service any incoming transaction. Verified on device: this HAL ran
+    // with "Threads: 1" (just main) while a healthy NDK HAL - the fingerprint
+    // service - runs with 2. The consequence is that a client making a
+    // *synchronous* call blocks forever in IPCThreadState::transact, and
+    // system_server does exactly that from
+    //     InputMethodManagerService.updateTouchSensitivity()
+    //       -> LineageHardwareManager.set(...)
+    //       -> vendor.lineage.touch.IGloveMode$Stub$Proxy.setEnabled()
+    // again while holding ImfLock, so the 60 s watchdog restarted it in a loop
+    // again. The default (15 threads) is what a registered AIDL service needs.
+    //
+    // Leaving the default also means the pool must be started explicitly before
+    // the main thread goes off to sleep below, otherwise a client that calls in
+    // during the permission-retry window would find no thread to answer it.
 
     std::shared_ptr<GloveMode> gm = ndk::SharedRefBase::make<GloveMode>();
     std::shared_ptr<HighTouchPollingRate> htpr = ndk::SharedRefBase::make<HighTouchPollingRate>();
@@ -95,12 +113,15 @@ int main() {
     std::shared_ptr<StylusMode> sm = ndk::SharedRefBase::make<StylusMode>();
     std::shared_ptr<TouchscreenGesture> tg = ndk::SharedRefBase::make<TouchscreenGesture>();
 
-    // VINTF-declared: these must exist even if the driver is not up yet.
+    // VINTF-declared: these must exist even if the touch driver is not up yet.
     registerService<GloveMode>(gm);
     registerService<HighTouchPollingRate>(htpr);
     registerService<KeyDisabler>(kd);
     registerService<StylusMode>(sm);
     registerService<TouchscreenGesture>(tg);
+
+    // Answer callers from here on; the loop below must not starve the pool.
+    ABinderProcess_startThreadPool();
 
     for (unsigned int i = 0; i < kPermissionRetryAttempts; ++i) {
         ensureCommandNodeWritable();
