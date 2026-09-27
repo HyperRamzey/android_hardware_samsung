@@ -69,8 +69,19 @@ ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
 
 namespace {
 
+// The node is a sysfs attribute of the DECON platform device itself, created by
+// decon_create_fingerprint_illum() via device_create_file(decon->dev, ...), so it
+// lands directly under the platform device's kobject. Verified on the device:
+//
+//     /sys/devices/platform/14860000.decon_f/fingerprint_illum
+//
+// The previous pattern had two problems and matched nothing: it looked for a
+// "decon0" directory, which does not exist on this board (the node is named
+// 14860000.decon_f), and it added an extra path level, so it was asking for
+// platform/<x>/decon0/fingerprint_illum rather than platform/<x>/fingerprint_illum.
+// Either mistake alone is fatal to a glob.
 const char kFingerprintIllumGlob[] =
-        "/sys/devices/platform/*/decon0/fingerprint_illum";
+        "/sys/devices/platform/*/fingerprint_illum";
 std::string gFingerprintIllumPath;
 
 void setFingerprintIllum(bool on) {
