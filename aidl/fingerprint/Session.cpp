@@ -15,6 +15,11 @@
 
 #include <dirent.h>
 #include <endian.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <glob.h>
+#include <string.h>
+#include <unistd.h>
 #include <thread>
 
 using namespace ::android::fingerprint::samsung;
@@ -62,9 +67,46 @@ ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
     return ndk::ScopedAStatus::ok();
 }
 
+namespace {
+
+const char kFingerprintIllumGlob[] =
+        "/sys/devices/platform/*/decon0/fingerprint_illum";
+std::string gFingerprintIllumPath;
+
+void setFingerprintIllum(bool on) {
+    if (gFingerprintIllumPath.empty()) {
+        glob_t paths;
+        if (glob(kFingerprintIllumGlob, 0, nullptr, &paths) == 0 && paths.gl_pathc > 0) {
+            gFingerprintIllumPath = paths.gl_pathv[0];
+        }
+        globfree(&paths);
+        LOG(INFO) << "fingerprint illum node: "
+                  << (gFingerprintIllumPath.empty() ? std::string("NOT FOUND")
+                                                    : gFingerprintIllumPath);
+    }
+
+    if (gFingerprintIllumPath.empty()) return;
+
+    int fd = open(gFingerprintIllumPath.c_str(), O_WRONLY);
+    if (fd < 0) {
+        LOG(ERROR) << "fingerprint illum: open failed: " << strerror(errno);
+        return;
+    }
+
+    const char value = on ? '1' : '0';
+    if (write(fd, &value, 1) != 1) {
+        LOG(ERROR) << "fingerprint illum: write failed: " << strerror(errno);
+    }
+    close(fd);
+    LOG(INFO) << "fingerprint illum: " << (on ? "enabled" : "disabled");
+}
+
+}  // namespace
+
 ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
                                    std::shared_ptr<ICancellationSignal>* out) {
     LOG(INFO) << "enroll";
+    setFingerprintIllum(true);
 
     if (FingerprintHalProperties::force_calibrate().value_or(false)) {
         mCaptureReady = false;
@@ -82,6 +124,7 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
     int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 60 /* timeoutSec */);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_enroll failed: " << error;
+        setFingerprintIllum(false);
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
@@ -100,10 +143,12 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
 ndk::ScopedAStatus Session::authenticate(int64_t operationId,
                                          std::shared_ptr<ICancellationSignal>* out) {
     LOG(INFO) << "authenticate";
+    setFingerprintIllum(true);
 
     int32_t error = mHal.ss_fingerprint_authenticate(operationId, mUserId);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_authenticate failed: " << error;
+        setFingerprintIllum(false);
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
@@ -294,6 +339,7 @@ ndk::ScopedAStatus Session::setIgnoreDisplayTouches(bool /*shouldIgnore*/) {
 
 ndk::ScopedAStatus Session::cancel() {
     int32_t ret = mHal.ss_fingerprint_cancel();
+    setFingerprintIllum(false);
 
     if (ret == 0) {
         mCb->onError(Error::CANCELED, 0 /* vendorCode */);
@@ -438,6 +484,7 @@ void Session::notify(const fingerprint_msg_t* msg) {
             }
             if (FingerprintHalProperties::cancel_on_enroll_completion().value_or(false)) {
                 if (msg->data.enroll.samples_remaining == 0) {
+                    setFingerprintIllum(false);
                     mHal.ss_fingerprint_cancel();
                 }
             }
@@ -459,6 +506,7 @@ void Session::notify(const fingerprint_msg_t* msg) {
             LOG(DEBUG) << "onAuthenticated(fid=" << msg->data.authenticated.finger.fid
                        << ", gid=" << msg->data.authenticated.finger.gid << ")";
             if (msg->data.authenticated.finger.fid != 0) {
+                setFingerprintIllum(false);
                 const hw_auth_token_t hat = msg->data.authenticated.hat;
                 HardwareAuthToken authToken;
                 translate(hat, authToken);
