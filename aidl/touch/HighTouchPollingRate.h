@@ -16,20 +16,7 @@ namespace touch {
 
 class HighTouchPollingRate : public BnHighTouchPollingRate {
   public:
-    HighTouchPollingRate() {
-        std::ifstream file(TSP_CMD_LIST_NODE);
-        if (file.is_open()) {
-            mHtprCmd = "";
-            std::string line;
-            while (getline(file, line)) {
-                if (!line.compare("set_game_mode") || !line.compare("set_scan_rate")) {
-                    mHtprCmd = line;
-                    break;
-                }
-            }
-            file.close();
-        }
-    }
+    HighTouchPollingRate() = default;
 
     bool isSupported();
 
@@ -37,6 +24,13 @@ class HighTouchPollingRate : public BnHighTouchPollingRate {
     ndk::ScopedAStatus setEnabled(bool enabled) override;
 
   private:
+    // Re-read the command list on demand instead of caching it in the
+    // constructor. This HAL starts at early-init, long before the ist40xx
+    // driver publishes /sys/class/sec/tsp/cmd_list, so a constructor-cached
+    // capability could never become true on a slow boot - and setEnabled()
+    // would then have written a malformed ",1" to the command node.
+    void probe();
+
     std::string mHtprCmd;
 };
 
