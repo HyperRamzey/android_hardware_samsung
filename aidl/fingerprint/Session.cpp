@@ -84,7 +84,35 @@ const char kFingerprintIllumGlob[] =
         "/sys/devices/platform/*/fingerprint_illum";
 std::string gFingerprintIllumPath;
 
+// The knob only ARMS the mask path. The LEVEL is a separate attribute,
+// /sys/class/lcd/panel/mask_brightness (lcd->mask_brightness), and its default is
+// 255. A71 commit 877ef30d9d16 documents 255 as breaking fingerprint enrollment
+// and 337 as the working value, and the panel log names the level directly:
+//     lcd panel: dsim_panel_mask_brightness: current(1) to mask(255)
+// Leaving the default in place is what made the trustlet reject every captured
+// frame with BAD_QUALITY 39 even though the mask layer was correctly engaged.
+constexpr const char kMaskBrightnessPath[] = "/sys/class/lcd/panel/mask_brightness";
+constexpr int kFingerprintIllumValue = 337;
+
+static void setMaskBrightness(int value) {
+    int fd = open(kMaskBrightnessPath, O_WRONLY);
+    if (fd < 0) {
+        LOG(ERROR) << "fingerprint illum level: open failed: " << strerror(errno);
+        return;
+    }
+    char buf[8];
+    int n = snprintf(buf, sizeof(buf), "%d", value);
+    if (write(fd, buf, n) != n) {
+        LOG(ERROR) << "fingerprint illum level: write failed: " << strerror(errno);
+    }
+    close(fd);
+}
+
 void setFingerprintIllum(bool on) {
+    // Level first, then arm. Reversing this engages the mask at the 255 default
+    // for one frame.
+    if (on) setMaskBrightness(kFingerprintIllumValue);
+
     if (gFingerprintIllumPath.empty()) {
         glob_t paths;
         if (glob(kFingerprintIllumGlob, 0, nullptr, &paths) == 0 && paths.gl_pathc > 0) {
@@ -96,7 +124,13 @@ void setFingerprintIllum(bool on) {
                                                     : gFingerprintIllumPath);
     }
 
-    if (gFingerprintIllumPath.empty()) return;
+    if (gFingerprintIllumPath.empty()) {
+        // Say why, once, rather than every call. A bare "NOT FOUND" on every
+        // attempt is what made this look like a missing kernel node.
+        LOG(ERROR) << "fingerprint illum: " << kFingerprintIllumGlob
+                   << " matched nothing; panel illumination is not being driven";
+        return;
+    }
 
     int fd = open(gFingerprintIllumPath.c_str(), O_WRONLY);
     if (fd < 0) {
