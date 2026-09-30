@@ -124,14 +124,18 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
         mHal.request(SEM_REQUEST_FORCE_CBGE, 1);
     }
 
-    hw_auth_token_t authToken;
+    hw_auth_token_t authToken{};
     translate(hat, authToken);
 
-    // NOTE (a30s ET715): timeoutSec must be non-zero. The vendor lib SKIPS Trustlet
-    // cmd 49 (sensor enroll-config) when it is 0 ("Skip cmd : 0xc, opcode : 49" in
-    // logcat); stock and the working a51 reference both enroll with a real timeout,
-    // and an unconfigured sensor rejects every frame (BAuth BAD_QUALITY 39).
-    // 60 s matches the AOSP framework enroll budget a51 passes through.
+    // NOTE (a30s ET715): timeoutSec must be non-zero; 60 s matches the AOSP
+    // framework enroll budget a51 passes through.
+    //
+    // CORRECTION 2026-09-30: the earlier comment here claimed the vendor lib
+    // skips Trustlet cmd 49 *when timeoutSec is 0*. That is FALSE. libbauthtzcommon
+    // hard-skips opcode 49 unconditionally (cmp w8,#0x31 / b.ne at +0x60d8), zeroes
+    // the opcode and returns 0. No argument influences it, and it is present on
+    // stock too. Do not re-chase this as a timeout problem.
+    // What DOES block enroll is the auth-token challenge (TA code 61 on mismatch).
     int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 60 /* timeoutSec */);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_enroll failed: " << error;
