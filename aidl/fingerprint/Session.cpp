@@ -155,7 +155,25 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
 
     if (FingerprintHalProperties::force_calibrate().value_or(false)) {
         mCaptureReady = false;
-        mHal.request(SEM_REQUEST_FORCE_CBGE, 1);
+
+        // a30s ET715 is an OPTICAL under-display sensor (ro.vendor.fingerprint.type
+        // = udfps_optical), but FORCE_CBGE is the CAPACITIVE enrollment path. Sending
+        // the capacitive request to an optical sensor leaves the trustlet unconfigured:
+        // its own frame counter stays at "nd cnt : 0" and every poll answers BAuth
+        // BAD_QUALITY 39, so enrollment never completes.
+        //
+        // SEM_REQUEST_OPTICAL_CALIBRATION (0x3F8) is what the optical path needs. It has
+        // been defined in VendorConstants.h since the tree was created and was never
+        // referenced anywhere. Keep FORCE_CBGE for genuinely capacitive sensors - the
+        // a30s is the only optical board on this tree, so this is a type gate rather
+        // than a board check.
+        const std::string typeProp = FingerprintHalProperties::type().value_or("");
+        if (typeProp == "udfps_optical") {
+            LOG(INFO) << "optical sensor: requesting SEM_REQUEST_OPTICAL_CALIBRATION";
+            mHal.request(SEM_REQUEST_OPTICAL_CALIBRATION, 1);
+        } else {
+            mHal.request(SEM_REQUEST_FORCE_CBGE, 1);
+        }
     }
 
     hw_auth_token_t authToken{};
