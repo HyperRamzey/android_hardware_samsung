@@ -11,6 +11,9 @@
 
 #include <hardware/fingerprint.h>
 
+#include <atomic>
+#include <chrono>
+
 #include "LegacyHAL.h"
 #include "LockoutTracker.h"
 
@@ -74,7 +77,28 @@ class Session : public BnSession {
     LegacyHAL mHal;
     LockoutTracker mLockoutTracker;
     bool mClosed = false;
-    bool mCaptureReady = false;
+
+    // Should this touch be swallowed because the optical calibration is still
+    // pending? True ONLY when this session positively armed a calibration that
+    // has not completed within its grace period. Every other case - including a
+    // session that never called enroll() - lets the touch through.
+    bool suppressForCalibration() const;
+    void logCalibrationOutcome(const char* when);
+
+    // Written by the enroll binder thread and by the notify worker thread, read
+    // on the pointer binder threads, hence atomic. The deadline is published
+    // before the flag so a reader can never see flag=false with a stale zero
+    // deadline (which would suppress for the entire session).
+    std::atomic<bool> mCaptureReady{true};
+    std::atomic<std::chrono::steady_clock::time_point> mCalibrationDeadline{};
+    // Latched in onPointerDown, consumed in onPointerUp, so one gesture cannot
+    // be split by the grace period expiring between the two.
+    std::atomic<bool> mTouchSuppressed{false};
+    // 10 s: the deadline only has to outlast CBGE's finger-off window. 30 s was
+    // half the 60 s enroll budget, which is a needlessly long dead-touch window
+    // if the trustlet never reports CAPTURE_READY. Spelled out rather than 10s
+    // because std::chrono_literals is not in scope in this header.
+    static constexpr std::chrono::milliseconds kCalibrationGraceMs{10000};
 
     Error VendorErrorFilter(int32_t error, int32_t* vendorCode);
     AcquiredInfo VendorAcquiredFilter(int32_t info, int32_t* vendorCode);
