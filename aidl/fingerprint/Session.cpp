@@ -94,6 +94,10 @@ std::string gFingerprintIllumPath;
 // frame with BAD_QUALITY 39 even though the mask layer was correctly engaged.
 constexpr const char kMaskBrightnessPath[] = "/sys/class/lcd/panel/mask_brightness";
 constexpr int kFingerprintIllumValue = 337;
+// UI_MAX_BRIGHTNESS in the panel driver: the value it programs into
+// mask_brightness at probe, and the level every other user of that
+// node (the panel's own burn-in mitigation) expects to find.
+constexpr int kPanelMaskBrightnessDefault = 255;
 
 static void setMaskBrightness(int value) {
     int fd = open(kMaskBrightnessPath, O_WRONLY);
@@ -145,6 +149,18 @@ void setFingerprintIllum(bool on) {
     }
     close(fd);
     LOG(INFO) << "fingerprint illum: " << (on ? "enabled" : "disabled");
+}
+
+// Release the mask layer and hand the mask level back to the panel.
+// The knob is the authority, so turning it off is what disengages the
+// layer; the level write that follows is invisible while it is off.
+// Restoring the panel default matters anyway: mask_brightness is shared
+// with the panel's burn-in mitigation, and leaving the fingerprint
+// level (337) behind would make that other user of the node emit at the
+// fingerprint brightness.
+static void releaseFingerprintIllum() {
+    setFingerprintIllum(false);
+    setMaskBrightness(kPanelMaskBrightnessDefault);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +235,14 @@ bool calibrationDataMissing() {
 ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
                                    std::shared_ptr<ICancellationSignal>* out) {
     LOG(INFO) << "enroll";
-    setFingerprintIllum(true);
+    // Pre-set the mask level only. Engaging the layer here lights the
+    // whole panel for as long as the session lives, and the framework
+    // keeps a session alive on the lockscreen and on AOD continuously
+    // - that is the "always at 100% brightness" regression. The level
+    // is invisible on its own (the knob is the sole authority for
+    // whether the layer emits), so it is set now and the layer is armed
+    // only when a finger actually lands, in onPointerDown().
+    setMaskBrightness(kFingerprintIllumValue);
 
     // Calibration is required when EITHER the property asks for it (stock OneUI
     // behaviour) OR the trustlet's calibration blobs are absent from /data.
@@ -258,7 +281,7 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
     int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 60 /* timeoutSec */);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_enroll failed: " << error;
-        setFingerprintIllum(false);
+        releaseFingerprintIllum();
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
@@ -285,12 +308,14 @@ ndk::ScopedAStatus Session::authenticate(int64_t operationId,
                                std::memory_order_release);
     mCaptureReady.store(true, std::memory_order_release);
     mTouchSuppressed.store(false, std::memory_order_release);
-    setFingerprintIllum(true);
+    // See enroll(): pre-set the level, arm the layer only on a real
+    // pointer-down.
+    setMaskBrightness(kFingerprintIllumValue);
 
     int32_t error = mHal.ss_fingerprint_authenticate(operationId, mUserId);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_authenticate failed: " << error;
-        setFingerprintIllum(false);
+        releaseFingerprintIllum();
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
@@ -406,6 +431,13 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t /*x*/, 
         return ndk::ScopedAStatus::ok();
     }
 
+    // A finger just landed: this is the start of actual capture
+    // progress, so arm the mask layer now. The level was pre-set at
+    // session start, so the layer engages already at the working 337
+    // instead of ramping through the 255 default, which is what broke
+    // enrollment (A71 877ef30d9d16).
+    setFingerprintIllum(true);
+
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
         mHal.request(SEM_REQUEST_TOUCH_EVENT, 2);
     }
@@ -421,6 +453,11 @@ ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
     if (mTouchSuppressed) {
         return ndk::ScopedAStatus::ok();
     }
+
+    // The gesture is over: release the layer and hand the level back.
+    // onPointerDown armed it, so this is its counterpart - without it
+    // the layer stays armed until the session ends.
+    releaseFingerprintIllum();
 
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
         mHal.request(SEM_REQUEST_TOUCH_EVENT, 1);
@@ -496,7 +533,7 @@ void Session::logCalibrationOutcome(const char* when) {
 
 ndk::ScopedAStatus Session::cancel() {
     int32_t ret = mHal.ss_fingerprint_cancel();
-    setFingerprintIllum(false);
+    releaseFingerprintIllum();
     logCalibrationOutcome("enroll cancelled");
 
     if (ret == 0) {
@@ -640,11 +677,17 @@ void Session::notify(const fingerprint_msg_t* msg) {
                 const_cast<fingerprint_msg_t*>(msg)->data.enroll.samples_remaining =
                         100 - msg->data.enroll.samples_remaining;
             }
-            if (FingerprintHalProperties::cancel_on_enroll_completion().value_or(false)) {
-                if (msg->data.enroll.samples_remaining == 0) {
-                    setFingerprintIllum(false);
-                    mHal.ss_fingerprint_cancel();
-                }
+            // Enrollment finished: release the layer unconditionally.
+            // Gating this on cancel_on_enroll_completion left the layer
+            // armed after the last sample whenever the property was
+            // unset - the stock default on this device - which is the
+            // "brightness never disengaged after enrollment" report.
+            // The layer is armed per pointer-down now, so this is a
+            // safety net for a pointer-up that never arrived, not the
+            // primary release.
+            if (msg->data.enroll.samples_remaining == 0) {
+                releaseFingerprintIllum();
+                mHal.ss_fingerprint_cancel();
             }
             LOG(DEBUG) << "onEnrollResult(fid=" << msg->data.enroll.finger.fid
                        << ", gid=" << msg->data.enroll.finger.gid
@@ -664,7 +707,7 @@ void Session::notify(const fingerprint_msg_t* msg) {
             LOG(DEBUG) << "onAuthenticated(fid=" << msg->data.authenticated.finger.fid
                        << ", gid=" << msg->data.authenticated.finger.gid << ")";
             if (msg->data.authenticated.finger.fid != 0) {
-                setFingerprintIllum(false);
+                releaseFingerprintIllum();
                 const hw_auth_token_t hat = msg->data.authenticated.hat;
                 HardwareAuthToken authToken;
                 translate(hat, authToken);
