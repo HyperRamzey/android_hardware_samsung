@@ -687,7 +687,12 @@ void Session::notify(const fingerprint_msg_t* msg) {
             // primary release.
             if (msg->data.enroll.samples_remaining == 0) {
                 releaseFingerprintIllum();
-                mHal.ss_fingerprint_cancel();
+                // Do NOT ss_fingerprint_cancel() here. Stock's HIDL flow ends
+                // a completed enroll without any cancel (zero srwf in a full
+                // success capture), while cancelling a committed session
+                // use-after-frees in libbauthserver: force_sigsegv right
+                // after srwf on every post-format attempt. Session::cancel()
+                // still covers mid-enroll user cancel; close() never cancelled.
             }
             LOG(DEBUG) << "onEnrollResult(fid=" << msg->data.enroll.finger.fid
                        << ", gid=" << msg->data.enroll.finger.gid
