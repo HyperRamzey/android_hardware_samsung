@@ -15,6 +15,12 @@
 
 #include <dirent.h>
 #include <endian.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <glob.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <thread>
 
 using namespace ::android::fingerprint::samsung;
@@ -62,29 +68,230 @@ ndk::ScopedAStatus Session::revokeChallenge(int64_t challenge) {
     return ndk::ScopedAStatus::ok();
 }
 
+namespace {
+
+// The node is a sysfs attribute of the DECON platform device itself, created by
+// decon_create_fingerprint_illum() via device_create_file(decon->dev, ...), so it
+// lands directly under the platform device's kobject. Verified on the device:
+//
+//     /sys/devices/platform/14860000.decon_f/fingerprint_illum
+//
+// The previous pattern had two problems and matched nothing: it looked for a
+// "decon0" directory, which does not exist on this board (the node is named
+// 14860000.decon_f), and it added an extra path level, so it was asking for
+// platform/<x>/decon0/fingerprint_illum rather than platform/<x>/fingerprint_illum.
+// Either mistake alone is fatal to a glob.
+const char kFingerprintIllumGlob[] =
+        "/sys/devices/platform/*/fingerprint_illum";
+std::string gFingerprintIllumPath;
+
+// The knob only ARMS the mask path. The LEVEL is a separate attribute,
+// /sys/class/lcd/panel/mask_brightness (lcd->mask_brightness), and its default is
+// 255. A71 commit 877ef30d9d16 documents 255 as breaking fingerprint enrollment
+// and 337 as the working value, and the panel log names the level directly:
+//     lcd panel: dsim_panel_mask_brightness: current(1) to mask(255)
+// Leaving the default in place is what made the trustlet reject every captured
+// frame with BAD_QUALITY 39 even though the mask layer was correctly engaged.
+constexpr const char kMaskBrightnessPath[] = "/sys/class/lcd/panel/mask_brightness";
+constexpr int kFingerprintIllumValue = 337;
+// UI_MAX_BRIGHTNESS in the panel driver: the value it programs into
+// mask_brightness at probe, and the level every other user of that
+// node (the panel's own burn-in mitigation) expects to find.
+constexpr int kPanelMaskBrightnessDefault = 255;
+
+static void setMaskBrightness(int value) {
+    int fd = open(kMaskBrightnessPath, O_WRONLY);
+    if (fd < 0) {
+        LOG(ERROR) << "fingerprint illum level: open failed: " << strerror(errno);
+        return;
+    }
+    char buf[8];
+    int n = snprintf(buf, sizeof(buf), "%d", value);
+    if (write(fd, buf, n) != n) {
+        LOG(ERROR) << "fingerprint illum level: write failed: " << strerror(errno);
+    }
+    close(fd);
+}
+
+void setFingerprintIllum(bool on) {
+    // Level first, then arm. Reversing this engages the mask at the 255 default
+    // for one frame.
+    if (on) setMaskBrightness(kFingerprintIllumValue);
+
+    if (gFingerprintIllumPath.empty()) {
+        glob_t paths;
+        if (glob(kFingerprintIllumGlob, 0, nullptr, &paths) == 0 && paths.gl_pathc > 0) {
+            gFingerprintIllumPath = paths.gl_pathv[0];
+        }
+        globfree(&paths);
+        LOG(INFO) << "fingerprint illum node: "
+                  << (gFingerprintIllumPath.empty() ? std::string("NOT FOUND")
+                                                    : gFingerprintIllumPath);
+    }
+
+    if (gFingerprintIllumPath.empty()) {
+        // Say why, once, rather than every call. A bare "NOT FOUND" on every
+        // attempt is what made this look like a missing kernel node.
+        LOG(ERROR) << "fingerprint illum: " << kFingerprintIllumGlob
+                   << " matched nothing; panel illumination is not being driven";
+        return;
+    }
+
+    int fd = open(gFingerprintIllumPath.c_str(), O_WRONLY);
+    if (fd < 0) {
+        LOG(ERROR) << "fingerprint illum: open failed: " << strerror(errno);
+        return;
+    }
+
+    const char value = on ? '1' : '0';
+    if (write(fd, &value, 1) != 1) {
+        LOG(ERROR) << "fingerprint illum: write failed: " << strerror(errno);
+    }
+    close(fd);
+    LOG(INFO) << "fingerprint illum: " << (on ? "enabled" : "disabled");
+}
+
+// Release the mask layer and hand the mask level back to the panel.
+// The knob is the authority, so turning it off is what disengages the
+// layer; the level write that follows is invisible while it is off.
+// Restoring the panel default matters anyway: mask_brightness is shared
+// with the panel's burn-in mitigation, and leaving the fingerprint
+// level (337) behind would make that other user of the node emit at the
+// fingerprint brightness.
+static void releaseFingerprintIllum() {
+    setFingerprintIllum(false);
+    setMaskBrightness(kPanelMaskBrightnessDefault);
+}
+
+// ---------------------------------------------------------------------------
+// Does the trustlet still have the calibration metadata it needs?
+//
+// The Egis OPTical sensor path (bauth_FPEGOPTBAuthSensorControl) keeps its
+// calibration / BDS blobs under /data/vendor/biometrics/meta/:
+//     calib.dat      500,000 B
+//     egoptbds.dat 1,192,092 B
+// Both are WRITTEN by the trustlet itself, never shipped, and a /data format
+// deletes them. With them absent the trustlet has no reference for the optical
+// path and rejects every frame:
+//
+//     FPBAuthServiceStorage::readBDSMetaData fileopen error : 2      (ENOENT)
+//     BAuth_Enroll_Do Fail BAD_QUALITY / Enroll Fail : 39           (every frame)
+//
+// which is exactly the "one scan takes, then nothing" symptom: illumination is
+// engaged, the finger is detected, frames reach the trustlet (nd_cnt climbs),
+// and the trustlet refuses all of them.
+//
+// These blobs are regenerated by the CBGE calibration, which is only ever
+// requested by SEM_REQUEST_FORCE_CBGE (cmd 21) - and the only code path that
+// sends that is the force_calibrate branch in enroll(). So the condition that
+// actually decides "run calibration" is "the calibration data is missing", not
+// the value of a build-time property.
+//
+// stat() is the right test: the directory is biometrics_vendor_data_file and this
+// HAL runs as uid 1000, which can read it. Verified on device with a positive
+// control - uid 1000 sees meta/calib.dat as absent AND type/type_check.dat as
+// present - because a blanket EACCES here would report "missing" permanently and
+// the gate would then fire on every session forever. Hence the ENOENT-only rule
+// below: only a genuinely absent (or truncated) blob may arm calibration.
+struct CalibrationBlob {
+    const char* path;
+    off_t minSize;
+};
+
+// Only ENOENT (and a zero/short blob) may arm calibration. Any other errno -
+// EACCES, ENOTDIR, ELOOP, or /data not being mounted yet at first-boot
+// enroll() - must NOT arm it, because arming starts a dead-touch window on every
+// session forever. Fail open instead: the pre-existing behaviour is strictly
+// better than silence.
+bool calibrationDataMissing() {
+    static constexpr CalibrationBlob kBlobs[] = {
+        {"/data/vendor/biometrics/meta/calib.dat", 500000},
+        {"/data/vendor/biometrics/meta/egoptbds.dat", 1192092},
+    };
+    for (const auto& blob : kBlobs) {
+        struct stat st {};
+        if (stat(blob.path, &st) == 0) {
+            if (st.st_size < blob.minSize) {
+                LOG(WARNING) << "calibration blob truncated: " << blob.path << " is "
+                             << st.st_size << " B, expected at least " << blob.minSize;
+                return true;
+            }
+            continue;
+        }
+        const int err = errno;  // capture before any logging can clobber it
+        if (err == ENOENT) {
+            LOG(INFO) << "calibration data missing: " << blob.path << " (ENOENT)";
+            return true;
+        }
+        LOG(WARNING) << "calibration probe inconclusive for " << blob.path << ": "
+                     << strerror(err) << "; not arming calibration";
+        return false;
+    }
+    return false;
+}
+
+}  // namespace
+
 ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
                                    std::shared_ptr<ICancellationSignal>* out) {
     LOG(INFO) << "enroll";
+    // Pre-set the mask level only. Engaging the layer here lights the
+    // whole panel for as long as the session lives, and the framework
+    // keeps a session alive on the lockscreen and on AOD continuously
+    // - that is the "always at 100% brightness" regression. The level
+    // is invisible on its own (the knob is the sole authority for
+    // whether the layer emits), so it is set now and the layer is armed
+    // only when a finger actually lands, in onPointerDown().
+    setMaskBrightness(kFingerprintIllumValue);
 
-    if (FingerprintHalProperties::force_calibrate().value_or(false)) {
-        mCaptureReady = false;
+    // Calibration is required when EITHER the property asks for it (stock OneUI
+    // behaviour) OR the trustlet's calibration blobs are absent from /data.
+    // The second term is what makes a factory-fresh or post-format /data recover
+    // without any user action: before this, the property stayed false forever,
+    // cmd 21 was never sent, and every frame was rejected with BAD_QUALITY 39.
+    const bool propWants = FingerprintHalProperties::force_calibrate().value_or(false);
+    const bool blobsGone = calibrationDataMissing();
+    if (propWants || blobsGone) {
+        LOG(INFO) << "enroll: calibration required (property=" << propWants
+                  << ", calibration data missing=" << blobsGone << ")";
+        // Order matters (see mCalibrationDeadline): a reader must never see
+        // flag=false together with a stale zero deadline, which would suppress
+        // for the whole session.
+        mCalibrationDeadline.store(std::chrono::steady_clock::now() + kCalibrationGraceMs,
+                                   std::memory_order_release);
+        mCaptureReady.store(false, std::memory_order_release);
         mHal.request(SEM_REQUEST_FORCE_CBGE, 1);
+    } else {
+        // No calibration pending: touches must flow immediately.
+        mCaptureReady.store(true, std::memory_order_release);
     }
 
-    hw_auth_token_t authToken;
+    hw_auth_token_t authToken{};
     translate(hat, authToken);
 
-    int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 0 /* timeoutSec */);
+    // NOTE (a30s ET715): timeoutSec must be non-zero; 60 s matches the AOSP
+    // framework enroll budget a51 passes through.
+    //
+    // CORRECTION 2026-09-30: the earlier comment here claimed the vendor lib
+    // skips Trustlet cmd 49 *when timeoutSec is 0*. That is FALSE. libbauthtzcommon
+    // hard-skips opcode 49 unconditionally (cmp w8,#0x31 / b.ne at +0x60d8), zeroes
+    // the opcode and returns 0. No argument influences it, and it is present on
+    // stock too. Do not re-chase this as a timeout problem.
+    // What DOES block enroll is the auth-token challenge (TA code 61 on mismatch).
+    int32_t error = mHal.ss_fingerprint_enroll(&authToken, mUserId, 60 /* timeoutSec */);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_enroll failed: " << error;
+        releaseFingerprintIllum();
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
-    if (FingerprintHalProperties::force_calibrate().value_or(false)) {
-        while (!mCaptureReady) {
-            std::this_thread::sleep_for(100ms);
-        }
-    }
+    // NOTE (a30s ET715): do NOT block here waiting for CAPTURE_READY. The old
+    // while(!mCaptureReady) loop held this binder thread forever with no timeout,
+    // wedging the framework scheduler (and making enroll uncancellable) whenever
+    // calibration did not complete. Stock OneUI instead swallows early touches
+    // until its enroll animation finishes (giving CBGE a finger-off window); we
+    // reproduce that below by gating TOUCH_EVENT forwarding on mCaptureReady.
+    // Progress callbacks arrive via notify() on HAL worker threads regardless.
 
     *out = SharedRefBase::make<CancellationSignal>(this);
     return ndk::ScopedAStatus::ok();
@@ -93,10 +300,22 @@ ndk::ScopedAStatus Session::enroll(const HardwareAuthToken& hat,
 ndk::ScopedAStatus Session::authenticate(int64_t operationId,
                                          std::shared_ptr<ICancellationSignal>* out) {
     LOG(INFO) << "authenticate";
+    // Calibration is an enroll-time concern. Clear any armed state so a session
+    // that also enrolled can never swallow authentication touches (P3).
+    // .store(), not assignment: for std::atomic<time_point> the braced form
+    // mCalibrationDeadline = {} is an ambiguous overload.
+    mCalibrationDeadline.store(std::chrono::steady_clock::time_point{},
+                               std::memory_order_release);
+    mCaptureReady.store(true, std::memory_order_release);
+    mTouchSuppressed.store(false, std::memory_order_release);
+    // See enroll(): pre-set the level, arm the layer only on a real
+    // pointer-down.
+    setMaskBrightness(kFingerprintIllumValue);
 
     int32_t error = mHal.ss_fingerprint_authenticate(operationId, mUserId);
     if (error) {
         LOG(ERROR) << "ss_fingerprint_authenticate failed: " << error;
+        releaseFingerprintIllum();
         mCb->onError(Error::UNABLE_TO_PROCESS, error);
     }
 
@@ -199,6 +418,26 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t /*x*/, 
                                           float /*minor*/, float /*major*/) {
     LOG(INFO) << "onPointerDown";
 
+    // a30s ET715: while force_calibrate calibration is pending (!mCaptureReady),
+    // swallow the touch like stock OneUI does during its enroll animation: forwarding
+    // TOUCH_EVENT mid-calibration poisons the background reference and every frame
+    // is then rejected (BAuth BAD_QUALITY 39 for the whole session).
+    // Latch the verdict for the whole gesture (P1): evaluating it separately in
+    // onPointerUp would let the grace period expire between down and up and
+    // emit a down with no up, leaving the trustlet with a dangling finger.
+    mTouchSuppressed.store(suppressForCalibration(), std::memory_order_release);
+    if (mTouchSuppressed) {
+        LOG(INFO) << "onPointerDown swallowed (calibration pending)";
+        return ndk::ScopedAStatus::ok();
+    }
+
+    // A finger just landed: this is the start of actual capture
+    // progress, so arm the mask layer now. The level was pre-set at
+    // session start, so the layer engages already at the working 337
+    // instead of ramping through the 255 default, which is what broke
+    // enrollment (A71 877ef30d9d16).
+    setFingerprintIllum(true);
+
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
         mHal.request(SEM_REQUEST_TOUCH_EVENT, 2);
     }
@@ -210,6 +449,15 @@ ndk::ScopedAStatus Session::onPointerDown(int32_t /*pointerId*/, int32_t /*x*/, 
 
 ndk::ScopedAStatus Session::onPointerUp(int32_t /*pointerId*/) {
     LOG(INFO) << "onPointerUp";
+
+    if (mTouchSuppressed) {
+        return ndk::ScopedAStatus::ok();
+    }
+
+    // The gesture is over: release the layer and hand the level back.
+    // onPointerDown armed it, so this is its counterpart - without it
+    // the layer stays armed until the session ends.
+    releaseFingerprintIllum();
 
     if (FingerprintHalProperties::request_touch_event().value_or(false)) {
         mHal.request(SEM_REQUEST_TOUCH_EVENT, 1);
@@ -272,8 +520,21 @@ ndk::ScopedAStatus Session::setIgnoreDisplayTouches(bool /*shouldIgnore*/) {
     return ndk::ScopedAStatus::ok();
 }
 
+// P5: when the enroll session ends, say whether the calibration actually
+// produced the blobs. Without this, "calibration ran and did not help" and
+// "calibration never ran" look identical - the silence trap, in this project's
+// own terms.
+void Session::logCalibrationOutcome(const char* when) {
+    const bool stillMissing = calibrationDataMissing();
+    LOG(INFO) << "calibration outcome (" << when << "): calibration data "
+              << (stillMissing ? "STILL MISSING - the trustlet did not regenerate it"
+                               : "present - calibration succeeded");
+}
+
 ndk::ScopedAStatus Session::cancel() {
     int32_t ret = mHal.ss_fingerprint_cancel();
+    releaseFingerprintIllum();
+    logCalibrationOutcome("enroll cancelled");
 
     if (ret == 0) {
         mCb->onError(Error::CANCELED, 0 /* vendorCode */);
@@ -416,10 +677,22 @@ void Session::notify(const fingerprint_msg_t* msg) {
                 const_cast<fingerprint_msg_t*>(msg)->data.enroll.samples_remaining =
                         100 - msg->data.enroll.samples_remaining;
             }
-            if (FingerprintHalProperties::cancel_on_enroll_completion().value_or(false)) {
-                if (msg->data.enroll.samples_remaining == 0) {
-                    mHal.ss_fingerprint_cancel();
-                }
+            // Enrollment finished: release the layer unconditionally.
+            // Gating this on cancel_on_enroll_completion left the layer
+            // armed after the last sample whenever the property was
+            // unset - the stock default on this device - which is the
+            // "brightness never disengaged after enrollment" report.
+            // The layer is armed per pointer-down now, so this is a
+            // safety net for a pointer-up that never arrived, not the
+            // primary release.
+            if (msg->data.enroll.samples_remaining == 0) {
+                releaseFingerprintIllum();
+                // Do NOT ss_fingerprint_cancel() here. Stock's HIDL flow ends
+                // a completed enroll without any cancel (zero srwf in a full
+                // success capture), while cancelling a committed session
+                // use-after-frees in libbauthserver: force_sigsegv right
+                // after srwf on every post-format attempt. Session::cancel()
+                // still covers mid-enroll user cancel; close() never cancelled.
             }
             LOG(DEBUG) << "onEnrollResult(fid=" << msg->data.enroll.finger.fid
                        << ", gid=" << msg->data.enroll.finger.gid
@@ -439,6 +712,7 @@ void Session::notify(const fingerprint_msg_t* msg) {
             LOG(DEBUG) << "onAuthenticated(fid=" << msg->data.authenticated.finger.fid
                        << ", gid=" << msg->data.authenticated.finger.gid << ")";
             if (msg->data.authenticated.finger.fid != 0) {
+                releaseFingerprintIllum();
                 const hw_auth_token_t hat = msg->data.authenticated.hat;
                 HardwareAuthToken authToken;
                 translate(hat, authToken);
@@ -466,7 +740,28 @@ void Session::notify(const fingerprint_msg_t* msg) {
 }
 
 void Session::onCaptureReady() {
-    mCaptureReady = true;
+    LOG(INFO) << "onCaptureReady (calibration complete)";
+    mCaptureReady.store(true, std::memory_order_release);
+}
+
+bool Session::suppressForCalibration() const {
+    // Fail open. Suppressing a touch is the exceptional case, so every path
+    // that is not positively known to be mid-calibration must let it through.
+    if (mCaptureReady.load(std::memory_order_acquire)) {
+        return false;
+    }
+    // A zero deadline means calibration was NEVER requested for this Session.
+    // Fingerprint.cpp CHECKs that only one Session exists at a time, so every
+    // operation gets a fresh object: an authenticate() session reaches here with
+    // both fields at their initialisers, and treating that as "calibrating"
+    // silently killed fingerprint unlock.
+    if (mCalibrationDeadline.load(std::memory_order_acquire) ==
+        std::chrono::steady_clock::time_point{}) {
+        return false;
+    }
+    // Calibration was requested but has not completed within its grace period.
+    return std::chrono::steady_clock::now() <= mCalibrationDeadline.load(
+            std::memory_order_acquire);
 }
 
 }  // namespace fingerprint

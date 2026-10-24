@@ -21,6 +21,11 @@ namespace biometrics {
 namespace fingerprint {
 
 inline void translate(const HardwareAuthToken& authToken, hw_auth_token_t& hat) {
+    // The FINGER trustlet rejects a non-zero version with TA code 60
+    // ("hat->version is not match", tl_hat_op_stub @ 0xf8c4). version is
+    // byte 0 of the packed struct and was previously left as stack garbage,
+    // so whether enroll succeeded depended on what was on the stack.
+    hat.version = HW_AUTH_TOKEN_VERSION;
     hat.challenge = authToken.challenge;
     hat.user_id = authToken.userId;
     hat.authenticator_id = authToken.authenticatorId;
